@@ -1,153 +1,250 @@
 /*
- * Proje: Okul Robotu - Core System
+ * Proje: Okul Robotu - Master Core System
  * Dosya: src/main.cpp
  * Geliştirici: Akkuş
- * Mimari: Non-blocking (millis tabanlı), State-Machine (Durum Makinesi)
- * Açıklama: Robotun ana kontrol döngüsüdür. Eski projede yaşanan 
- * donma/kilitlenme sorunlarını önlemek için delay() KESİNLİKLE kullanılmamıştır.
+ * Mimari: State-Machine & Modular OOP
+ * Açıklama: MotorController, SensorManager ve AdminAuth modüllerini
+ * birleştiren tam donanımlı, non-blocking ana kontrol yazılımı.
  */
 
 #include <Arduino.h>
+#include "MotorController.h"
+#include "SensorManager.h"
+#include "AdminAuth.h"
 
-// --- 1. SİSTEM DURUMLARI (STATE MACHINE) ---
+// --- 1. DONANIM PIN TANIMLAMALARI ---
+// Sol Motor Pinleri (L298N / TB6612 vb.)
+const uint8_t LEFT_IN1 = 2;
+const uint8_t LEFT_IN2 = 3;
+const uint8_t LEFT_ENA = 5; // PWM Destekli Pin
+
+// Sağ Motor Pinleri
+const uint8_t RIGHT_IN1 = 4;
+const uint8_t RIGHT_IN2 = 7;
+const uint8_t RIGHT_ENB = 6; // PWM Destekli Pin
+
+// Ultrasonik Sensör Pinleri
+const uint8_t TRIG_PIN = 8;
+const uint8_t ECHO_PIN = 9;
+
+// --- 2. NESNE MİMARİSİ (MODÜLLER) ---
+MotorController motors(LEFT_IN1, LEFT_IN2, LEFT_ENA, RIGHT_IN1, RIGHT_IN2, RIGHT_ENB);
+SensorManager sensors(TRIG_PIN, ECHO_PIN, 15.0); // 15 cm engel sınırı
+AdminAuth admin("akkus_admin123");                // Varsayılan Admin Şifresi
+
+// --- 3. SİSTEM DURUMLARI ---
 enum class SystemState {
-    INIT,           // Sistem başlatılıyor, donanım testi
-    IDLE,           // Boşta, komut bekliyor
-    ADMIN_MODE,     // Yönetici yetkileri devrede (Manuel Kontrol vb.)
-    AUTO_DRIVE,     // Sürüş ve otonom hareket modu
-    SAFE_STOP,      // Engel veya tehlike anında acil duruş
-    SYSTEM_ERROR    // Donanım veya yazılım hatası
+    INIT,
+    IDLE,
+    ADMIN_MODE,
+    AUTO_DRIVE,
+    SAFE_STOP,
+    SYSTEM_LOCKED
 };
 
-// Başlangıç durumu
 SystemState currentState = SystemState::INIT;
 
-// --- 2. ZAMANLAMA (NON-BLOCKING TIMERS) ---
-unsigned long lastSensorUpdate = 0;
+// --- 4. ZAMANLAYICILAR (NON-BLOCKING) ---
 unsigned long lastHeartbeat = 0;
-const unsigned long SENSOR_INTERVAL = 50;      // 50ms (Saniyede 20 kez sensör okuma)
-const unsigned long HEARTBEAT_INTERVAL = 1000; // 1 saniyede bir sistem yaşıyor sinyali
+const unsigned long HEARTBEAT_INTERVAL = 1000; // 1 Saniye
 
-// --- 3. FONKSİYON PROTOTİPLERİ ---
-void processState();
-void readSensorsTask();
-void systemHeartbeatTask();
-void emergencyStop(const char* reason);
-void checkSerialCommands();
+// --- 5. FONKSİYON PROTOTİPLERİ ---
+void processSerialCommands();
+void handleAutoDrive();
+void handleAdminMode();
+void triggerEmergencyStop(const char* reason);
 
-// --- 4. KURULUM (SETUP) ---
+// --- 6. KURULUM (SETUP) ---
 void setup() {
-    // Seri haberleşme başlat (Hata ayıklama ve Admin komutları için)
     Serial.begin(115200);
-    while (!Serial) { delay(10); } // Seri portun donanım olarak oturmasını bekle
+    while (!Serial) { delay(10); }
 
     Serial.println(F("======================================="));
-    Serial.println(F("[SYSTEM] Okul Robotu OS Baslatiliyor..."));
+    Serial.println(F("[SYS] Okul Robotu OS v2.0 Baslatiliyor..."));
     Serial.println(F("======================================="));
 
-    // İleride modül dosyalarını yazdıkça buraya eklenecekler:
-    // MotorController::init();
-    // SensorManager::init();
-    // AdminAuth::init();
+    // Modülleri Başlat
+    motors.begin();
+    sensors.begin();
+    admin.begin();
 
-    Serial.println(F("[OK] Donanim testleri basarili."));
-    Serial.println(F("[SYSTEM] IDLE (Bekleme) moduna gecildi."));
+    Serial.println(F("[OK] Tum donanimlar ve moduller basariyla yuklendi."));
+    Serial.println(F("[SYS] Durum: IDLE. Komut bekleniyor."));
     
     currentState = SystemState::IDLE;
 }
 
-// --- 5. ANA DÖNGÜ (LOOP) ---
+// --- 7. ANA DÖNGÜ (LOOP) ---
 void loop() {
     unsigned long currentMillis = millis();
 
-    // Görev 1: Sensörleri sürekli ve takılmadan oku (Multitasking simülasyonu)
-    if (currentMillis - lastSensorUpdate >= SENSOR_INTERVAL) {
-        lastSensorUpdate = currentMillis;
-        readSensorsTask();
+    // Sensör verilerini döngüyü aksatmadan güncelle
+    sensors.update();
+
+    // Dışarıdan gelen komutları kontrol et
+    processSerialCommands();
+
+    // Sistem Güvenlik Kilit Durumu Kontrolü
+    if (admin.isLocked()) {
+        if (currentState != SystemState::SYSTEM_LOCKED) {
+            triggerEmergencyStop("Cok fazla hatali admin girisi! Sistem kilitlendi.");
+            currentState = SystemState::SYSTEM_LOCKED;
+        }
+        return;
     }
 
-    // Görev 2: Sistemin çalıştığını gösteren Heartbeat (Yaşam) sinyali
-    if (currentMillis - lastHeartbeat >= HEARTBEAT_INTERVAL) {
-        lastHeartbeat = currentMillis;
-        systemHeartbeatTask();
-    }
-
-    // Görev 3: Dışarıdan (Bluetooth/Serial) gelen admin komutlarını dinle
-    checkSerialCommands();
-
-    // Görev 4: Robotun o anki durumunu (State) işlet
-    processState();
-}
-
-// --- 6. GÖREV FONKSİYONLARI ---
-
-void processState() {
+    // Durum Makinesi İşletimi
     switch (currentState) {
         case SystemState::INIT:
-            // Setup içinde hallediliyor
             break;
 
         case SystemState::IDLE:
-            // Robot duruyor, motorlar kapalı, güvenli modda bekliyor
+            motors.stopAll();
             break;
 
         case SystemState::ADMIN_MODE:
-            // Admin tarafından gelen özel komutlar işleniyor (Kalibrasyon vb.)
+            handleAdminMode();
             break;
 
         case SystemState::AUTO_DRIVE:
-            // Motor sürücü ve engel aşma algoritmaları burada çalışacak
+            handleAutoDrive();
             break;
 
         case SystemState::SAFE_STOP:
-            // Çarpışma algılandıysa sadece geri çıkışa veya admin komutuna izin ver
+            motors.stopAll();
             break;
 
-        case SystemState::SYSTEM_ERROR:
-            // Kritik hata, her şeyi kilitle
+        case SystemState::SYSTEM_LOCKED:
+            motors.stopAll();
             break;
+    }
+
+    // Sistem Yaşam (Heartbeat) Sinyali
+    if (currentMillis - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+        lastHeartbeat = currentMillis;
+        // Serial.println(F("[SYS] Alive..."));
     }
 }
 
-void readSensorsTask() {
-    // İleride eklenecek: Mesafe veya çizgi sensörleri filtrelenerek okunacak.
-    // Örnek acil durum senaryosu:
-    // if (distance < 10) { emergencyStop("ON_ENGEL_ALGILANDI"); }
+// --- 8. MANTIKSAL FONKSİYONLAR ---
+
+void handleAutoDrive() {
+    // Sensör engeli algıladı mı?
+    if (sensors.isObstacleDetected()) {
+        motors.stopAll();
+        Serial.print(F("[ENGEL] Yakin mesafe algilandi: "));
+        Serial.print(sensors.getFilteredDistanceCm());
+        Serial.println(F(" cm. Otomatik durus yapildi."));
+        currentState = SystemState::SAFE_STOP;
+        return;
+    }
+
+    // Engel yoksa güvenli hızda ileri git
+    motors.moveForward(180);
 }
 
-void checkSerialCommands() {
-    if (Serial.available() > 0) {
-        String cmd = Serial.readStringUntil('\n');
-        cmd.trim();
+void handleAdminMode() {
+    // Admin modundayken yapılacak özel iş mantıkları (Sürekli duruşta bekleme vb.)
+}
 
-        if (cmd.length() == 0) return;
+void processSerialCommands() {
+    if (Serial.available() == 0) return;
 
-        // Admin ve Güvenlik Kontrolleri
-        if (cmd == "ADMIN_LOGIN") {
+    String rawInput = Serial.readStringUntil('\n');
+    rawInput.trim();
+
+    if (rawInput.length() == 0) return;
+
+    // Komut Parçalama: "LOGIN akkus_admin123" veya "MOVE FORWARD 200"
+    int spaceIndex = rawInput.indexOf(' ');
+    String command = (spaceIndex == -1) ? rawInput : rawInput.substring(0, spaceIndex);
+    String param = (spaceIndex == -1) ? "" : rawInput.substring(spaceIndex + 1);
+
+    command.toUpperCase();
+
+    // --- GENEL KOMUTLAR ---
+    if (command == "STOP") {
+        triggerEmergencyStop("Kullanici tarafindan STOP komutu verildi.");
+        return;
+    }
+
+    // --- ADMIN YETKİLENDİRME KOMUTLARI ---
+    if (command == "LOGIN") {
+        if (admin.login(param)) {
             currentState = SystemState::ADMIN_MODE;
-            Serial.println(F("[AUTH] Admin Modu Aktif Edildi."));
-        } 
-        else if (cmd == "START_DRIVE" && currentState == SystemState::ADMIN_MODE) {
-            currentState = SystemState::AUTO_DRIVE;
-            Serial.println(F("[INFO] Surus Modu Baslatildi."));
+            Serial.println(F("[AUTH] Admin girisi basarili. Admin moduna gecildi."));
+        } else {
+            Serial.println(F("[HATA] Hatali sifre!"));
+            if (admin.isLocked()) {
+                Serial.println(F("[KRITIK] Maksimum deneme asildi. Sistem kilitlendi!"));
+            }
         }
-        else if (cmd == "STOP") {
-            emergencyStop("Manuel Acil Durdurma Komutu Alindi");
-        }
-        else {
-            Serial.println(F("[HATA] Bilinmeyen komut veya yetkisiz erisim!"));
-        }
+        return;
+    }
+
+    if (command == "LOGOUT") {
+        admin.logout();
+        currentState = SystemState::IDLE;
+        motors.stopAll();
+        Serial.println(F("[AUTH] Admin oturumu kapatildi. IDLE moduna gecildi."));
+        return;
+    }
+
+    // --- ADMIN YETKİSİ GEREKTİREN KOMUTLAR ---
+    if (!admin.isLoggedIn()) {
+        Serial.println(F("[RED] Bu komut icin Admin oturumu acmalisiniz! Usg: LOGIN <sifre>"));
+        return;
+    }
+
+    // Yetki Alınmış Komutlar
+    if (command == "START_AUTO") {
+        currentState = SystemState::AUTO_DRIVE;
+        Serial.println(F("[MODE] Otonom Surus Modu Baslatildi."));
+    } 
+    else if (command == "FORWARD") {
+        uint8_t spd = param.length() > 0 ? param.toInt() : 150;
+        motors.moveForward(spd);
+        Serial.print(F("[MANUEL] Ileri git: Hiz "));
+        Serial.println(spd);
+    }
+    else if (command == "BACKWARD") {
+        uint8_t spd = param.length() > 0 ? param.toInt() : 150;
+        motors.moveBackward(spd);
+        Serial.print(F("[MANUEL] Geri git: Hiz "));
+        Serial.println(spd);
+    }
+    else if (command == "LEFT") {
+        uint8_t spd = param.length() > 0 ? param.toInt() : 150;
+        motors.turnLeft(spd);
+        Serial.println(F("[MANUEL] Sola donus"));
+    }
+    else if (command == "RIGHT") {
+        uint8_t spd = param.length() > 0 ? param.toInt() : 150;
+        motors.turnRight(spd);
+        Serial.println(F("[MANUEL] Saga donus"));
+    }
+    else if (command == "GET_DIST") {
+        Serial.print(F("[SENSOR] Ham Mesafe: "));
+        Serial.print(sensors.getRawDistanceCm());
+        Serial.print(F(" cm | Filtreli Mesafe: "));
+        Serial.print(sensors.getFilteredDistanceCm());
+        Serial.println(F(" cm"));
+    }
+    else if (command == "SET_LIMIT") {
+        float limit = param.toFloat();
+        sensors.setObstacleThreshold(limit);
+        Serial.print(F("[CONFIG] Yeni engel siniri ayarlandi: "));
+        Serial.print(limit);
+        Serial.println(F(" cm"));
+    }
+    else {
+        Serial.println(F("[HATA] Bilinmeyen Admin Komutu!"));
     }
 }
 
-void emergencyStop(const char* reason) {
-    // İleride MotorController::stopAll() eklenecek
+void triggerEmergencyStop(const char* reason) {
+    motors.stopAll();
     currentState = SystemState::SAFE_STOP;
-    Serial.print(F("[ALARM] ACIL DURUS! Sebep: "));
+    Serial.print(F("[ALARM] ACIL DURUS! Nedeni: "));
     Serial.println(reason);
-}
-
-void systemHeartbeatTask() {
-    // Sistem durumunu anlık olarak konsola/Bluetooth'a yazdırabiliriz
-    // Serial.println(F("[SYS] System Online.")); 
 }
